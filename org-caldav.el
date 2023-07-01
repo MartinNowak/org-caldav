@@ -1844,7 +1844,8 @@ Returns MD5 from entry."
   (when (> (length description) 0)
     (when org-caldav-description-blank-line-before (newline))
     (let ((beg (point)))
-      (insert description)
+      ;; Escape headlines https://orgmode.org/manual/Escape-Character.html
+      (insert (replace-regexp-in-string "^\s*\\*" "​*" description))
       (org-indent-region beg (point)))
     (when org-caldav-description-blank-line-after (newline))
     (newline)))
