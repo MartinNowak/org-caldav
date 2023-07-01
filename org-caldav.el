@@ -981,19 +981,7 @@ If RESUME is non-nil, try to resume."
 	(org-caldav-check-oauth2 org-caldav-url)
 	;; Retrieve token
 	(org-caldav-retrieve-oauth2-token org-caldav-url org-caldav-calendar-id))
-      (let ((numretry 0)
-	    success)
-	(while (null success)
-	  (condition-case err
-	      (progn
-		(org-caldav-check-connection)
-		(setq success t))
-	    (error
-	     (if (= numretry (1- org-caldav-retry-attempts))
-		 (org-caldav-check-connection)
-	       (org-caldav-debug-print
-		1 "Got error while checking connection (will try again):" err)
-	       (cl-incf numretry))))))
+      ;; TODO: [[https://sabre.io/dav/building-a-caldav-client/#discovery][discovery]]
       (unless resume
 	(setq org-caldav-event-list nil
 	      org-caldav-previous-files nil)
