@@ -582,14 +582,22 @@ default namespace."
 	  (while (re-search-forward "</?" nil t)
 	    (insert "DAV:")))))))
 
-(defun org-caldav-url-dav-get-properties (url property)
+(defun org-caldav-url-dav-get-properties (url property depth)
   "Retrieve PROPERTY from URL.
 Output is the same as `url-dav-get-properties'.  This switches to
 OAuth2 if necessary."
+  ;; Take care of the default value for depth...
+  (setq depth (or depth 0))
+
+  ;; Now let's translate it into something webdav can understand.
+  (if (< depth 0)
+      (setq depth "Infinity")
+    (setq depth (int-to-string depth)))
+
   (let ((request-data (concat "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n"
-			      "<DAV:propfind xmlns:DAV='DAV:'>\n<DAV:prop>"
-			      "<DAV:" property "/></DAV:prop></DAV:propfind>\n"))
-	(extra '(("Depth" . "1") ("Content-type" . "text/xml"))))
+			      "<DAV:propfind xmlns:DAV='DAV:' xmlns:CALDAV='urn:ietf:params:xml:ns:caldav'>\n<DAV:prop>"
+			      "<" property " /></DAV:prop></DAV:propfind>\n"))
+        (extra `(("Depth" . ,depth) ("Content-type" . "text/xml"))))
     (let ((resultbuf (org-caldav-url-retrieve-synchronously
                       url "PROPFIND" request-data extra))
           (retr 1))
@@ -612,31 +620,53 @@ OAuth2 if necessary."
       (org-caldav-namespace-bug-workaround resultbuf)
       (url-dav-process-response resultbuf url))))
 
-(defun org-caldav-check-connection ()
-  "Check connection by doing a PROPFIND on CalDAV URL.
-Also sets `org-caldav-empty-calendar' if calendar is empty."
-  (org-caldav-debug-print 1 (format "Check connection for %s."
-				    (org-caldav-events-url)))
-  (org-caldav-check-dav (org-caldav-events-url))
-  (let* ((output (org-caldav-url-dav-get-properties
-		  (org-caldav-events-url) "resourcetype"))
-	 (status (plist-get (cdar output) 'DAV:status)))
-    ;; We accept any 2xx status. Since some CalDAV servers return 404
-    ;; for a newly created and not yet used calendar, we accept it as
-    ;; well.
-    (unless (or (= (/ status 100) 2)
-		(= status 404))
-      (org-caldav-debug-print 1 "Got error status from PROPFIND: " output)
-      (error "Could not query CalDAV URL %s." (org-caldav-events-url)))
-    (if (= status 404)
-	(progn
-	  (org-caldav-debug-print 1 "Got 404 status - assuming calendar is new and empty.")
-	  (setq org-caldav-empty-calendar t))
-      (when (= (length output) 1)
-	;; This is an empty calendar; fetching etags might return 404.
-	(org-caldav-debug-print 1 "This is an empty calendar. Setting flag.")
-	(setq org-caldav-empty-calendar t)))
-    t))
+(defun url-dav-process-DAV:current-user-principal (node)
+  ;; get href url of DAV:current-user-principal node
+  (url-dav-node-text (car-safe (xml-get-children node 'DAV:href))))
+
+(defalias 'url-dav-process-urn:ietf:params:xml:ns:caldavcalendar-home-set 'url-dav-process-DAV:current-user-principal)
+
+(defun gracefully-process-empty-prop-handling (orig &rest args)
+  "Gracefully handle empty props, e.g. PROPFIND for optional
+displayname returning an empty 200 OK prop and a 404 Not Found
+prop."
+  (if (xml-node-children (car args)) (apply orig args) nil))
+
+(advice-add 'url-dav-process-DAV:prop :around #'gracefully-process-empty-prop-handling)
+
+(defun url-concat (url path-or-url)
+  "Concat path-or-url to base, dependening on whether it is absolute, relative, or comes with a new hostname"
+  (cond
+   ;; full url
+   ((string-search "://" path-or-url) path-or-url)
+   ;; absolute path
+   ((string-prefix-p "/" path-or-url) (if (string-match ".*://[^/#?]*\\(.*\\)" url) (replace-match path-or-url nil t url 1) (concat url path-or-url)))
+   ;; relative path
+   (t (concat url path-or-url))))
+
+(defun org-caldav-discover (url name-or-id)
+  "Discover calendar name-or-id under url for authenticated principal using CALDAV:calendar-home-set.
+  https://datatracker.ietf.org/doc/html/rfc4791#section-6.2.1
+  "
+  (org-caldav-debug-print 1 (format "Discovering calendar for %s." url))
+  (let* (
+         ;; TODO: check given formatted calendar url first
+         ;; https://datatracker.ietf.org/doc/html/rfc5397#section-3
+         (response (org-caldav-url-dav-get-properties url "DAV:current-user-principal" 0))
+         (status (plist-get (cdar response) 'DAV:status))
+         (principal-url (if (= (/ status 100) 2) (plist-get (cdar response) 'DAV:current-user-principal)))
+         (url (url-concat url principal-url))
+         ;; https://datatracker.ietf.org/doc/html/rfc4791#section-6.2.1
+         (response (org-caldav-url-dav-get-properties url "CALDAV:calendar-home-set" 0))
+         (status (plist-get (cdar response) 'DAV:status))
+         (home-url (if (= (/ status 100) 2) (plist-get (cdar response) 'urn:ietf:params:xml:ns:caldavcalendar-home-set)))
+         (url (url-concat url home-url))
+         (response (org-caldav-url-dav-get-properties url "DAV:displayname" 1))
+         ;; TODO: compare formatted caldar url?
+         (calendar-url (car-safe (seq-find (lambda (n) (let ((url (car n)) (props (cdr n))) (or (string-search name-or-id url) (string= (plist-get props 'DAV:displayname) name-or-id)))) response)))
+         (url (url-concat url (or calendar-url name-or-id)))
+         )
+    url))
 
 ;; This defun is partly taken out of url-dav.el, written by Bill Perry.
 (defun org-caldav-get-icsfiles-etags-from-properties (properties)
@@ -660,7 +690,7 @@ Return list with elements (uid . etag)."
   (if org-caldav-empty-calendar
       nil
     (let ((output (org-caldav-url-dav-get-properties
-		   (org-caldav-events-url) "getetag")))
+		   (org-caldav-events-url) "DAV:getetag" 1)))
       (cond
        ((> (length output) 1)
 	;; Everything looks OK - we got a list of "things".
@@ -805,17 +835,9 @@ Are you really sure? ")))
 
 (defun org-caldav-events-url ()
   "Return URL for events."
-  (let* ((url
-	  (if (org-caldav-use-oauth2)
-	      (nth 4 (assoc org-caldav-url org-caldav-oauth2-providers))
-	    org-caldav-url))
-	 (eventsurl
-	  (if (string-match ".*%s.*" url)
-	      (format url org-caldav-calendar-id)
-	    (concat url "/" org-caldav-calendar-id "/"))))
-    (if (string-match ".*/$" eventsurl)
-	eventsurl
-      (concat eventsurl "/"))))
+  (if (org-caldav-use-oauth2)
+      (concat (format (nth 4 (assoc org-caldav-url org-caldav-oauth2-providers)) org-caldav-calendar-id) "/")
+      org-caldav-url))
 
 (defun org-caldav-update-eventdb-from-org (buf)
   "With combined ics file in BUF, update the event database."
@@ -976,12 +998,13 @@ If RESUME is non-nil, try to resume."
 	  ;; prevent https://github.com/dengste/org-caldav/issues/230
 	  (org-id-update-id-locations files-for-sync)))
       ;; Check if we need to do OAuth2
-      (when (org-caldav-use-oauth2)
-	;; We need to do oauth2. Check if it is available.
-	(org-caldav-check-oauth2 org-caldav-url)
-	;; Retrieve token
-	(org-caldav-retrieve-oauth2-token org-caldav-url org-caldav-calendar-id))
-      ;; TODO: [[https://sabre.io/dav/building-a-caldav-client/#discovery][discovery]]
+      (if (not (org-caldav-use-oauth2))
+          ;; Caldav discovery
+          (setq org-caldav-url (org-caldav-discover org-caldav-url org-caldav-calendar-id))
+	  ;; We need to do oauth2. Check if it is available.
+	  (org-caldav-check-oauth2 org-caldav-url)
+	  ;; Retrieve token
+	  (org-caldav-retrieve-oauth2-token org-caldav-url org-caldav-calendar-id))
       (unless resume
 	(setq org-caldav-event-list nil
 	      org-caldav-previous-files nil)
